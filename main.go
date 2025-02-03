@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,18 +33,39 @@ const discoveryNamespace = "cross-swap-network"
 // mDNS discovery interval
 const discoveryInterval = time.Second * 10
 
+// connectedPeers keeps track of peers we're connected to
+var connectedPeers = make(map[peer.ID]struct{})
+var peerMapLock sync.RWMutex
+
 // mdnsNotifee gets notified when we find a new peer via mDNS discovery
 type mdnsNotifee struct {
 	h host.Host
 }
 
 func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// Check if we're already connected
+	peerMapLock.RLock()
+	_, exists := connectedPeers[pi.ID]
+	peerMapLock.RUnlock()
+
+	if exists {
+		return
+	}
+
 	if n.h.Network().Connectedness(pi.ID) != network.Connected {
-		log.Printf("Found peer via mDNS: %s, connecting...", pi.ID.String())
+		log.Printf("📡 Found new peer via mDNS: %s", pi.ID.String()[:12])
 		if err := n.h.Connect(context.Background(), pi); err != nil {
-			log.Printf("Failed to connect to peer %s: %s", pi.ID, err)
+			// Only log if it's not a self-dial or common connection error
+			if !strings.Contains(err.Error(), "dial to self attempted") &&
+				!strings.Contains(err.Error(), "connection refused") &&
+				!strings.Contains(err.Error(), "i/o timeout") {
+				log.Printf("❌ Failed to connect to local peer %s: %s", pi.ID.String()[:12], err)
+			}
 		} else {
-			log.Printf("✅ Successfully connected to peer %s via mDNS", pi.ID.String())
+			peerMapLock.Lock()
+			connectedPeers[pi.ID] = struct{}{}
+			peerMapLock.Unlock()
+			log.Printf("✅ Connected to local peer: %s", pi.ID.String()[:12])
 		}
 	}
 }
@@ -89,13 +111,11 @@ func main() {
 	for _, addr := range bootstrapPeers {
 		ma, err := multiaddr.NewMultiaddr(addr)
 		if err != nil {
-			log.Printf("Invalid bootstrap address: %s", err)
 			continue
 		}
 
 		peerinfo, err := peer.AddrInfoFromP2pAddr(ma)
 		if err != nil {
-			log.Printf("Failed to get peer info: %s", err)
 			continue
 		}
 
@@ -103,9 +123,16 @@ func main() {
 		go func(pi *peer.AddrInfo) {
 			defer wg.Done()
 			if err := h.Connect(ctx, *pi); err != nil {
-				log.Printf("Failed to connect to bootstrap node %s: %s", pi.ID, err)
+				// Only log if it's not a common connection error
+				if !strings.Contains(err.Error(), "connection refused") &&
+					!strings.Contains(err.Error(), "i/o timeout") {
+					log.Printf("⚠️ Bootstrap node %s unavailable", pi.ID.String()[:12])
+				}
 			} else {
-				log.Printf("✅ Connected to bootstrap node: %s", pi.ID)
+				peerMapLock.Lock()
+				connectedPeers[pi.ID] = struct{}{}
+				peerMapLock.Unlock()
+				log.Printf("✅ Connected to bootstrap node: %s", pi.ID.String()[:12])
 			}
 		}(peerinfo)
 	}
@@ -119,10 +146,16 @@ func main() {
 	// Print the node's detailed information
 	log.Println("\n📋 Node Information:")
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	log.Printf("🆔 Node ID: %s\n", h.ID().String())
+	log.Printf("🆔 Node ID: %s\n", h.ID().String()[:12])
 	log.Println("📡 Listening Addresses:")
 
+	// Only show relevant addresses
 	for _, addr := range h.Addrs() {
+		addrStr := addr.String()
+		if strings.Contains(addrStr, "127.0.0.1") ||
+			strings.Contains(addrStr, "::1") {
+			continue // Skip localhost addresses
+		}
 		fullAddr := addr.Encapsulate(multiaddr.StringCast("/p2p/" + h.ID().String()))
 		log.Printf("   └─ %s\n", fullAddr)
 	}
@@ -148,7 +181,6 @@ func main() {
 }
 
 func setupMDNS(h host.Host, ns string) error {
-	// Create an mDNS service
 	s := mdns.NewMdnsService(h, ns, &mdnsNotifee{h: h})
 	return s.Start()
 }
@@ -164,21 +196,37 @@ func discoverPeers(ctx context.Context, routingDiscovery *drouting.RoutingDiscov
 		case <-ticker.C:
 			peers, err := routingDiscovery.FindPeers(ctx, discoveryNamespace)
 			if err != nil {
-				log.Printf("❌ Error finding peers: %s\n", err)
 				continue
 			}
 
 			for peer := range peers {
+				// Skip if it's us or if we're already connected
 				if peer.ID == h.ID() {
-					continue // Skip ourselves
+					continue
 				}
+
+				peerMapLock.RLock()
+				_, exists := connectedPeers[peer.ID]
+				peerMapLock.RUnlock()
+				if exists {
+					continue
+				}
+
 				if h.Network().Connectedness(peer.ID) != network.Connected {
 					_, err = h.Network().DialPeer(ctx, peer.ID)
 					if err != nil {
-						log.Printf("❌ Failed to connect to peer %s: %s\n", peer.ID, err)
+						// Only log if it's not a common connection error
+						if !strings.Contains(err.Error(), "dial to self attempted") &&
+							!strings.Contains(err.Error(), "connection refused") &&
+							!strings.Contains(err.Error(), "i/o timeout") {
+							log.Printf("❌ Failed to connect to peer %s: %s\n", peer.ID.String()[:12], err)
+						}
 						continue
 					}
-					log.Printf("🔗 Connected to peer: %s\n", peer.ID)
+					peerMapLock.Lock()
+					connectedPeers[peer.ID] = struct{}{}
+					peerMapLock.Unlock()
+					log.Printf("🔗 Connected to peer: %s\n", peer.ID.String()[:12])
 				}
 			}
 		}
