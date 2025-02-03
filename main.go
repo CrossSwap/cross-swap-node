@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -23,6 +24,28 @@ var bootstrapPeers = []string{
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+}
+
+// discoveryNamespace is used as the namespace for both DHT and mDNS discovery
+const discoveryNamespace = "cross-swap-network"
+
+// mDNS discovery interval
+const discoveryInterval = time.Second * 10
+
+// mdnsNotifee gets notified when we find a new peer via mDNS discovery
+type mdnsNotifee struct {
+	h host.Host
+}
+
+func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if n.h.Network().Connectedness(pi.ID) != network.Connected {
+		log.Printf("Found peer via mDNS: %s, connecting...", pi.ID.String())
+		if err := n.h.Connect(context.Background(), pi); err != nil {
+			log.Printf("Failed to connect to peer %s: %s", pi.ID, err)
+		} else {
+			log.Printf("✅ Successfully connected to peer %s via mDNS", pi.ID.String())
+		}
+	}
 }
 
 func main() {
@@ -47,6 +70,13 @@ func main() {
 		log.Fatal("Failed to create libp2p host:", err)
 	}
 	defer h.Close()
+
+	// Setup Local Network Discovery (mDNS)
+	if err := setupMDNS(h, discoveryNamespace); err != nil {
+		log.Printf("⚠️ Failed to setup mDNS discovery: %s", err)
+	} else {
+		log.Println("✅ Local network discovery (mDNS) enabled")
+	}
 
 	// Create a Kademlia DHT
 	kdht, err := dht.New(ctx, h, dht.Mode(dht.ModeServer))
@@ -102,7 +132,7 @@ func main() {
 	routingDiscovery := drouting.NewRoutingDiscovery(kdht)
 
 	// Advertise this node
-	routingDiscovery.Advertise(ctx, "cross-swap-network")
+	routingDiscovery.Advertise(ctx, discoveryNamespace)
 	log.Println("✨ Successfully announced ourselves to the network")
 
 	// Look for other peers
@@ -117,8 +147,14 @@ func main() {
 	log.Println("Received signal, shutting down...")
 }
 
+func setupMDNS(h host.Host, ns string) error {
+	// Create an mDNS service
+	s := mdns.NewMdnsService(h, ns, &mdnsNotifee{h: h})
+	return s.Start()
+}
+
 func discoverPeers(ctx context.Context, routingDiscovery *drouting.RoutingDiscovery, h host.Host) {
-	ticker := time.NewTicker(time.Second * 10)
+	ticker := time.NewTicker(discoveryInterval)
 	defer ticker.Stop()
 
 	for {
@@ -126,7 +162,7 @@ func discoverPeers(ctx context.Context, routingDiscovery *drouting.RoutingDiscov
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			peers, err := routingDiscovery.FindPeers(ctx, "cross-swap-network")
+			peers, err := routingDiscovery.FindPeers(ctx, discoveryNamespace)
 			if err != nil {
 				log.Printf("❌ Error finding peers: %s\n", err)
 				continue
